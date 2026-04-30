@@ -46,6 +46,7 @@ const admsTrafficLogPath = path.join(logsDir, 'adms-traffic.log');
 const admsCommandResultsLogPath = path.join(logsDir, 'adms-command-results.log');
 const admsBiodataLogPath = path.join(dataDir, 'adms-biodata.log');
 const admsBiophotoLogPath = path.join(dataDir, 'adms-biophoto.log');
+const admsAttlogLogPath = path.join(dataDir, 'adms-attlog.log');
 const logStore = createZkLogStore({
     filePath: path.join(__dirname, 'logs.txt'),
     maxEntries: parseInteger(process.env.ZK_LOG_LIMIT, 200)
@@ -333,6 +334,8 @@ app.all('/iclock/cdata', asyncHandler(async (req, res) => {
         );
     }
 
+    persistirAttlog(registros, req);
+
     sendPlainText(res, flushPendingCommands());
 }));
 
@@ -366,29 +369,32 @@ app.all('/iclock/devicecmd', asyncHandler(async (req, res) => {
 app.post('/adms/queue-user', asyncHandler(async (req, res) => {
     const pin = normalizePin(req.body.pin);
     const rawName = typeof req.body.name === 'string' ? req.body.name : '';
-    const admsName = normalizeAdmsCommandName(rawName).replace(/[\t\r\n=]/g, '').slice(0, 24);
+    const admsName = normalizeAdmsQueueField(rawName, 24, true);
     const rawPassword = typeof req.body.password === 'string' ? req.body.password : '';
-    const admsPassword = rawPassword.replace(/[^\x20-\x7E]/g, '').replace(/[\t\r\n=]/g, '').slice(0, 24);
+    const admsPassword = normalizeAdmsQueueField(rawPassword, 24, false);
 
     if (!pin || !admsName) {
         return res.status(400).json({ ok: false, error: 'Debes enviar pin numerico y name valido' });
     }
 
-    const commandId = admsCommandId++;
-    const command = `C:${commandId}:DATA UPDATE USERINFO PIN=${pin}\tName=${admsName}\tPri=0\tPasswd=${admsPassword}\tCard=\tGrp=1\tTZ=0000000100000000\tVerify=0\tViceCard=\tStartDatetime=0\tEndDatetime=0`;
-    encolarComando(command);
+    const userCommand = enqueueAdmsUserinfoCommand({
+        pin,
+        name: admsName,
+        password: admsPassword,
+        verify: 0
+    });
 
     logStore.info('adms.queue-user.enqueued', {
         pin,
         name: admsName,
-        commandId,
+        commandId: userCommand.commandId,
         pendingCommands: comandosPendientes.length
     });
 
     res.json({
         ok: true,
-        commandId,
-        command,
+        commandId: userCommand.commandId,
+        command: userCommand.command,
         pendingCommands: comandosPendientes.length
     });
 }));
@@ -401,34 +407,72 @@ app.get('/adms/biophotos', asyncHandler(async (_req, res) => {
     res.json(readJsonLinesFile(admsBiophotoLogPath));
 }));
 
+app.get('/adms/attendance', asyncHandler(async (req, res) => {
+    const pin = normalizePin(req.query.pin);
+    res.json(readAttendanceEntries({
+        pin,
+        from: req.query.from,
+        to: req.query.to,
+        limit: req.query.limit
+    }));
+}));
+
+app.get('/adms/attendance/:pin', asyncHandler(async (req, res) => {
+    const pin = normalizePin(req.params.pin);
+    if (!pin) {
+        return res.status(400).json({ ok: false, error: 'PIN invalido' });
+    }
+
+    res.json(readAttendanceEntries({
+        pin,
+        from: req.query.from,
+        to: req.query.to,
+        limit: req.query.limit
+    }));
+}));
+
+app.get('/adms/attendance-summary', asyncHandler(async (req, res) => {
+    const pin = normalizePin(req.query.pin);
+    const date = normalizeDateFilter(req.query.date);
+
+    if (!pin || !date) {
+        return res.status(400).json({ ok: false, error: 'Debes enviar pin y date validos' });
+    }
+
+    res.json(buildAttendanceSummary(pin, date));
+}));
+
 app.post('/adms/queue-user-verify', asyncHandler(async (req, res) => {
     const pin = normalizePin(req.body.pin);
     const rawName = typeof req.body.name === 'string' ? req.body.name : '';
-    const admsName = normalizeAdmsCommandName(rawName).replace(/[\t\r\n=]/g, '').slice(0, 24);
+    const admsName = normalizeAdmsQueueField(rawName, 24, true);
     const rawPassword = typeof req.body.password === 'string' ? req.body.password : '';
-    const admsPassword = rawPassword.replace(/[^\x20-\x7E]/g, '').replace(/[\t\r\n=]/g, '').slice(0, 24);
+    const admsPassword = normalizeAdmsQueueField(rawPassword, 24, false);
     const verify = Number.parseInt(req.body.verify, 10);
 
     if (!pin || !admsName || !admsPassword || !Number.isInteger(verify) || verify < 0 || verify > 255) {
         return res.status(400).json({ ok: false, error: 'Debes enviar pin, name, password y verify validos' });
     }
 
-    const commandId = admsCommandId++;
-    const command = `C:${commandId}:DATA UPDATE USERINFO PIN=${pin}\tName=${admsName}\tPri=0\tPasswd=${admsPassword}\tCard=\tGrp=1\tTZ=0000000100000000\tVerify=${verify}\tViceCard=\tStartDatetime=0\tEndDatetime=0`;
-    encolarComando(command);
+    const userCommand = enqueueAdmsUserinfoCommand({
+        pin,
+        name: admsName,
+        password: admsPassword,
+        verify
+    });
 
     logStore.info('adms.queue-user-verify.enqueued', {
         pin,
         name: admsName,
         verify,
-        commandId,
+        commandId: userCommand.commandId,
         pendingCommands: comandosPendientes.length
     });
 
     res.json({
         ok: true,
-        commandId,
-        command,
+        commandId: userCommand.commandId,
+        command: userCommand.command,
         pendingCommands: comandosPendientes.length
     });
 }));
@@ -441,39 +485,13 @@ app.post('/adms/queue-copy-face', asyncHandler(async (req, res) => {
         return res.status(400).json({ ok: false, error: 'Debes enviar sourcePin y targetPin validos' });
     }
 
-    const biophotoEntries = readJsonLinesFile(admsBiophotoLogPath);
-    const biodataEntries = readJsonLinesFile(admsBiodataLogPath);
-    const latestBiophoto = findLatestAdmsEntry(biophotoEntries, sourcePin, '9');
-    const latestBiodata = findLatestAdmsEntry(biodataEntries, sourcePin, '9');
-
-    if (!latestBiophoto) {
-        return res.status(404).json({ ok: false, error: `No existe BIOPHOTO Type=9 para sourcePin ${sourcePin}` });
-    }
-
-    if (!latestBiodata) {
-        return res.status(404).json({ ok: false, error: `No existe BIODATA Type=9 para sourcePin ${sourcePin}` });
-    }
-
-    const biophotoFileName = String(latestBiophoto.savedAs || `${latestBiophoto.pin}-${latestBiophoto.type}-${latestBiophoto.index}.jpg`);
-    const biophotoFilePath = path.join(biophotosDir, biophotoFileName);
-    if (!fs.existsSync(biophotoFilePath)) {
-        return res.status(404).json({ ok: false, error: `No existe el archivo BIOPHOTO ${biophotoFileName}` });
-    }
-
-    const biophotoBase64 = fs.readFileSync(biophotoFilePath).toString('base64');
-    const biophotoCommandId = admsCommandId++;
-    const biodataCommandId = admsCommandId++;
-    const biophotoCommand = `C:${biophotoCommandId}:DATA UPDATE BIOPHOTO PIN=${targetPin}\tNo=${latestBiophoto.no}\tIndex=${latestBiophoto.index}\tFileName=${targetPin}.jpg\tType=9\tSize=${latestBiophoto.size}\tContent=${biophotoBase64}`;
-    const biodataCommand = `C:${biodataCommandId}:DATA UPDATE BIODATA Pin=${targetPin}\tNo=${latestBiodata.no}\tIndex=${latestBiodata.index}\tValid=1\tDuress=0\tType=9\tMajorVer=35\tMinorVer=4\tFormat=0\tTmp=${latestBiodata.tmp}`;
-
-    encolarComando(biophotoCommand);
-    encolarComando(biodataCommand);
+    const faceCommands = enqueueAdmsFaceCopyCommands(sourcePin, targetPin);
 
     logStore.info('adms.queue-copy-face.enqueued', {
         sourcePin,
         targetPin,
-        biophotoCommandId,
-        biodataCommandId,
+        biophotoCommandId: faceCommands.commandIds.biophoto,
+        biodataCommandId: faceCommands.commandIds.biodata,
         pendingCommands: comandosPendientes.length
     });
 
@@ -481,27 +499,46 @@ app.post('/adms/queue-copy-face', asyncHandler(async (req, res) => {
         ok: true,
         sourcePin,
         targetPin,
-        commandIds: {
-            biophoto: biophotoCommandId,
-            biodata: biodataCommandId
-        },
-        summary: {
-            biophoto: {
-                no: latestBiophoto.no,
-                index: latestBiophoto.index,
-                type: latestBiophoto.type,
-                size: latestBiophoto.size,
-                fileName: `${targetPin}.jpg`
-            },
-            biodata: {
-                no: latestBiodata.no,
-                index: latestBiodata.index,
-                type: latestBiodata.type,
-                majorVer: latestBiodata.majorVer,
-                minorVer: latestBiodata.minorVer,
-                format: latestBiodata.format
-            }
-        },
+        commandIds: faceCommands.commandIds,
+        summary: faceCommands.summary,
+        pendingCommands: comandosPendientes.length
+    });
+}));
+
+app.post('/adms/enroll-user-with-face', asyncHandler(async (req, res) => {
+    const pin = normalizePin(req.body.pin);
+    const rawName = typeof req.body.name === 'string' ? req.body.name : '';
+    const name = normalizeAdmsQueueField(rawName, 24, true);
+    const rawPassword = typeof req.body.password === 'string' ? req.body.password : '';
+    const password = normalizeAdmsQueueField(rawPassword, 24, false);
+    const sourceFacePin = normalizePin(req.body.sourceFacePin);
+
+    if (!pin || !name || !sourceFacePin) {
+        return res.status(400).json({ ok: false, error: 'Debes enviar pin, name y sourceFacePin validos' });
+    }
+
+    const userCommand = enqueueAdmsUserinfoCommand({
+        pin,
+        name,
+        password,
+        verify: 0
+    });
+    const faceCommands = enqueueAdmsFaceCopyCommands(sourceFacePin, pin);
+
+    logStore.info('adms.enroll-user-with-face.enqueued', {
+        pin,
+        sourceFacePin,
+        userCommandId: userCommand.commandId,
+        biophotoCommandId: faceCommands.commandIds.biophoto,
+        biodataCommandId: faceCommands.commandIds.biodata,
+        pendingCommands: comandosPendientes.length
+    });
+
+    res.json({
+        ok: true,
+        pin,
+        userCommandId: userCommand.commandId,
+        faceCommandIds: faceCommands.commandIds,
         pendingCommands: comandosPendientes.length
     });
 }));
@@ -732,6 +769,82 @@ function readJsonLinesFile(filePath) {
         .filter(Boolean);
 }
 
+function normalizeAdmsQueueField(value, maxLength, useNameSanitizer) {
+    const baseValue = useNameSanitizer ? normalizeAdmsCommandName(value) : String(value || '').replace(/[^\x20-\x7E]/g, '');
+    return baseValue.replace(/[\t\r\n=]/g, '').slice(0, maxLength);
+}
+
+function enqueueAdmsUserinfoCommand({ pin, name, password, verify }) {
+    const commandId = admsCommandId++;
+    const command = `C:${commandId}:DATA UPDATE USERINFO PIN=${pin}\tName=${name}\tPri=0\tPasswd=${password}\tCard=\tGrp=1\tTZ=0000000100000000\tVerify=${verify}\tViceCard=\tStartDatetime=0\tEndDatetime=0`;
+    encolarComando(command);
+
+    return {
+        commandId,
+        command
+    };
+}
+
+function enqueueAdmsFaceCopyCommands(sourcePin, targetPin) {
+    const biophotoEntries = readJsonLinesFile(admsBiophotoLogPath);
+    const biodataEntries = readJsonLinesFile(admsBiodataLogPath);
+    const latestBiophoto = findLatestAdmsEntry(biophotoEntries, sourcePin, '9');
+    const latestBiodata = findLatestAdmsEntry(biodataEntries, sourcePin, '9');
+
+    if (!latestBiophoto) {
+        const error = new Error(`No existe BIOPHOTO Type=9 para sourcePin ${sourcePin}`);
+        error.statusCode = 404;
+        throw error;
+    }
+
+    if (!latestBiodata) {
+        const error = new Error(`No existe BIODATA Type=9 para sourcePin ${sourcePin}`);
+        error.statusCode = 404;
+        throw error;
+    }
+
+    const biophotoFileName = String(latestBiophoto.savedAs || `${latestBiophoto.pin}-${latestBiophoto.type}-${latestBiophoto.index}.jpg`);
+    const biophotoFilePath = path.join(biophotosDir, biophotoFileName);
+    if (!fs.existsSync(biophotoFilePath)) {
+        const error = new Error(`No existe el archivo BIOPHOTO ${biophotoFileName}`);
+        error.statusCode = 404;
+        throw error;
+    }
+
+    const biophotoBase64 = fs.readFileSync(biophotoFilePath).toString('base64');
+    const biophotoCommandId = admsCommandId++;
+    const biodataCommandId = admsCommandId++;
+    const biophotoCommand = `C:${biophotoCommandId}:DATA UPDATE BIOPHOTO PIN=${targetPin}\tNo=${latestBiophoto.no}\tIndex=${latestBiophoto.index}\tFileName=${targetPin}.jpg\tType=9\tSize=${latestBiophoto.size}\tContent=${biophotoBase64}`;
+    const biodataCommand = `C:${biodataCommandId}:DATA UPDATE BIODATA Pin=${targetPin}\tNo=${latestBiodata.no}\tIndex=${latestBiodata.index}\tValid=1\tDuress=0\tType=9\tMajorVer=35\tMinorVer=4\tFormat=0\tTmp=${latestBiodata.tmp}`;
+
+    encolarComando(biophotoCommand);
+    encolarComando(biodataCommand);
+
+    return {
+        commandIds: {
+            biophoto: biophotoCommandId,
+            biodata: biodataCommandId
+        },
+        summary: {
+            biophoto: {
+                no: latestBiophoto.no,
+                index: latestBiophoto.index,
+                type: latestBiophoto.type,
+                size: latestBiophoto.size,
+                fileName: `${targetPin}.jpg`
+            },
+            biodata: {
+                no: latestBiodata.no,
+                index: latestBiodata.index,
+                type: latestBiodata.type,
+                majorVer: latestBiodata.majorVer,
+                minorVer: latestBiodata.minorVer,
+                format: latestBiodata.format
+            }
+        }
+    };
+}
+
 function findLatestAdmsEntry(entries, pin, type) {
     for (let index = entries.length - 1; index >= 0; index -= 1) {
         const entry = entries[index];
@@ -741,6 +854,69 @@ function findLatestAdmsEntry(entries, pin, type) {
     }
 
     return null;
+}
+
+function readAttendanceEntries(filters = {}) {
+    const pin = String(filters.pin || '').trim();
+    const from = normalizeDateFilter(filters.from);
+    const to = normalizeDateFilter(filters.to);
+    const limit = normalizeAttendanceLimit(filters.limit);
+
+    let entries = readJsonLinesFile(admsAttlogLogPath)
+        .filter(entry => !pin || entry.pin === pin)
+        .filter(entry => {
+            const entryDate = String(entry.timestamp || '').slice(0, 10);
+            if (from && entryDate < from) {
+                return false;
+            }
+
+            if (to && entryDate > to) {
+                return false;
+            }
+
+            return true;
+        })
+        .sort((left, right) => String(right.timestamp || '').localeCompare(String(left.timestamp || '')));
+
+    if (limit > 0) {
+        entries = entries.slice(0, limit);
+    }
+
+    return entries;
+}
+
+function buildAttendanceSummary(pin, date) {
+    const checks = readAttendanceEntries({ pin, from: date, to: date })
+        .slice()
+        .reverse()
+        .map(entry => ({
+            timestamp: entry.timestamp,
+            verifyMode: entry.verifyMode,
+            sn: entry.sn
+        }));
+
+    return {
+        pin,
+        date,
+        firstCheck: checks.length > 0 ? checks[0].timestamp : null,
+        lastCheck: checks.length > 0 ? checks[checks.length - 1].timestamp : null,
+        totalChecks: checks.length,
+        checks
+    };
+}
+
+function normalizeDateFilter(value) {
+    const raw = String(value || '').trim();
+    return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : '';
+}
+
+function normalizeAttendanceLimit(value) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+        return 0;
+    }
+
+    return Math.min(parsed, 1000);
 }
 
 function getRawIclockBody(req) {
@@ -1020,7 +1196,7 @@ function procesarRegistros(body) {
         .map(linea => linea.trim())
         .filter(linea => /^\d+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\d+/.test(linea))
         .map(linea => {
-            const match = linea.match(/^(\d+)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(\d+)/);
+            const match = linea.match(/^(\d+)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(\d+)(?:\s+(\d+))?(?:\s+([^\s]+))?/);
             if (!match) {
                 return null;
             }
@@ -1028,11 +1204,38 @@ function procesarRegistros(body) {
             return {
                 pin: match[1],
                 fecha: `${match[2]} ${match[3]}`,
+                timestamp: `${match[2]} ${match[3]}`,
                 metodo: match[4],
-                metodoTexto: traducirMetodo(match[4])
+                metodoTexto: traducirMetodo(match[4]),
+                verifyStatus: match[4],
+                verifyMode: match[5] || '',
+                workCode: match[6] || '',
+                rawLine: linea
             };
         })
         .filter(Boolean);
+}
+
+function persistirAttlog(registros, req) {
+    if (!Array.isArray(registros) || registros.length === 0) {
+        return;
+    }
+
+    const sn = String(req.query.SN || req.query.sn || '').trim();
+    const receivedAt = new Date().toISOString();
+
+    for (const registro of registros) {
+        appendJsonLine(admsAttlogLogPath, {
+            pin: registro.pin,
+            timestamp: registro.timestamp,
+            verifyStatus: registro.verifyStatus,
+            verifyMode: registro.verifyMode,
+            workCode: registro.workCode,
+            rawLine: registro.rawLine,
+            sn,
+            receivedAt
+        });
+    }
 }
 
 function encolarComando(cmd) {
