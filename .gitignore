@@ -1,0 +1,10 @@
+node_modules/
+.env
+logs/
+logs.txt
+data/
+uploads/
+artifacts/
+asistencias.txt
+__pycache__/
+*.pyc
