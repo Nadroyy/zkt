@@ -48,6 +48,7 @@ const admsCommandResultsLogPath = path.join(logsDir, 'adms-command-results.log')
 const admsBiodataLogPath = path.join(dataDir, 'adms-biodata.log');
 const admsBiophotoLogPath = path.join(dataDir, 'adms-biophoto.log');
 const admsAttlogLogPath = path.join(dataDir, 'adms-attlog.log');
+const admsPersonsLogPath = path.join(dataDir, 'adms-persons.jsonl');
 const logStore = createZkLogStore({
     filePath: path.join(__dirname, 'logs.txt'),
     maxEntries: parseInteger(process.env.ZK_LOG_LIMIT, 200)
@@ -609,6 +610,14 @@ app.post('/adms/enroll-person', upload.single('image'), asyncHandler(async (req,
         password,
         tempFilePath: req.file.path
     });
+    persistAdmsPerson({
+        pin,
+        name,
+        photo: enrollment.savedPhoto,
+        imageSize: enrollment.imageSize,
+        userCommandId: enrollment.userCommandId,
+        biophotoCommandId: enrollment.biophotoCommandId
+    });
 
     logStore.info('adms.enroll-person.enqueued', {
         pin,
@@ -628,6 +637,36 @@ app.post('/adms/enroll-person', upload.single('image'), asyncHandler(async (req,
         savedPhoto: enrollment.savedPhoto,
         imageSize: enrollment.imageSize,
         message: 'Persona encolada para enrolamiento ADMS'
+    });
+}));
+
+app.get('/adms/persons', asyncHandler(async (_req, res) => {
+    res.json(readLatestAdmsPersons());
+}));
+
+app.get('/adms/persons/:pin', asyncHandler(async (req, res) => {
+    const pin = normalizePin(req.params.pin);
+    if (!pin) {
+        return res.status(400).json({ ok: false, error: 'PIN invalido' });
+    }
+
+    const person = readLatestAdmsPersonByPin(pin);
+    if (!person) {
+        return res.status(404).json({ ok: false, error: 'Persona no encontrada' });
+    }
+
+    res.json({
+        ...person,
+        attendance: readAttendanceEntries({ pin, limit: 10 })
+    });
+}));
+
+app.post('/adms/persons/rebuild', asyncHandler(async (_req, res) => {
+    const rebuilt = rebuildAdmsPersonsFromFiles();
+    res.json({
+        ok: true,
+        rebuilt: rebuilt.length,
+        persons: rebuilt
     });
 }));
 
@@ -855,6 +894,98 @@ function readJsonLinesFile(filePath) {
             }
         })
         .filter(Boolean);
+}
+
+function persistAdmsPerson({ pin, name, photo, imageSize, userCommandId, biophotoCommandId }) {
+    const now = new Date().toISOString();
+    const previous = readLatestAdmsPersonByPin(pin);
+
+    appendJsonLine(admsPersonsLogPath, {
+        pin,
+        name,
+        photo,
+        imageSize,
+        userCommandId,
+        biophotoCommandId,
+        createdAt: previous ? previous.createdAt : now,
+        updatedAt: now
+    });
+}
+
+function readLatestAdmsPersons() {
+    const latestByPin = new Map();
+    for (const entry of readJsonLinesFile(admsPersonsLogPath)) {
+        if (!entry || !entry.pin) {
+            continue;
+        }
+
+        latestByPin.set(entry.pin, {
+            pin: entry.pin,
+            name: entry.name,
+            photo: entry.photo,
+            imageSize: entry.imageSize,
+            createdAt: entry.createdAt,
+            updatedAt: entry.updatedAt
+        });
+    }
+
+    return Array.from(latestByPin.values())
+        .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+}
+
+function readLatestAdmsPersonByPin(pin) {
+    return readLatestAdmsPersons().find(entry => entry.pin === pin) || null;
+}
+
+function rebuildAdmsPersonsFromFiles() {
+    const previousByPin = new Map(readLatestAdmsPersons().map(entry => [entry.pin, entry]));
+    const rebuilt = fs.readdirSync(facesUploadsDir)
+        .map(fileName => {
+            const match = fileName.match(/^(\d+)\.jpg$/i);
+            if (!match) {
+                return null;
+            }
+
+            const pin = match[1];
+            const absolutePath = path.join(facesUploadsDir, fileName);
+            const stats = fs.statSync(absolutePath);
+            const previous = previousByPin.get(pin);
+            const timestamp = resolveFileTimestamp(stats);
+
+            return {
+                pin,
+                name: previous?.name || `PIN_${pin}`,
+                photo: `uploads/faces/${fileName}`,
+                imageSize: stats.size,
+                userCommandId: previous?.userCommandId || null,
+                biophotoCommandId: previous?.biophotoCommandId || null,
+                createdAt: previous?.createdAt || timestamp,
+                updatedAt: timestamp
+            };
+        })
+        .filter(Boolean)
+        .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+
+    const fileContent = rebuilt.map(entry => JSON.stringify(entry)).join('\n');
+    fs.writeFileSync(admsPersonsLogPath, fileContent ? `${fileContent}\n` : '');
+
+    return rebuilt.map(entry => ({
+        pin: entry.pin,
+        name: entry.name,
+        photo: entry.photo,
+        imageSize: entry.imageSize,
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt
+    }));
+}
+
+function resolveFileTimestamp(stats) {
+    const candidate = stats.birthtime instanceof Date && !Number.isNaN(stats.birthtime.getTime())
+        ? stats.birthtime
+        : stats.mtime;
+    return candidate instanceof Date && !Number.isNaN(candidate.getTime())
+        ? candidate.toISOString()
+        : new Date().toISOString();
 }
 
 function normalizeAdmsQueueField(value, maxLength, useNameSanitizer) {
