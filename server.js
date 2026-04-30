@@ -552,50 +552,82 @@ app.post('/adms/enroll-user-with-photo-file', upload.single('image'), asyncHandl
     const rawPassword = typeof req.body.password === 'string' ? req.body.password : '';
     const password = normalizeAdmsQueueField(rawPassword, 24, false);
 
-    if (!pin || !name) {
-        return res.status(400).json({ ok: false, error: 'Debes enviar pin y name validos' });
+    if (!pin || !name || !password) {
+        return res.status(400).json({ ok: false, error: 'Debes enviar pin, name y password validos' });
     }
 
     if (!req.file) {
         return res.status(400).json({ ok: false, error: 'Debes enviar image en multipart/form-data' });
     }
 
-    const savedFileName = `${pin}.jpg`;
-    const savedFilePath = path.join(facesUploadsDir, savedFileName);
-    fs.renameSync(req.file.path, savedFilePath);
-
-    const imageBuffer = fs.readFileSync(savedFilePath);
-    const imageBase64 = imageBuffer.toString('base64');
-    const imageSize = imageBuffer.length;
-
-    const userCommand = enqueueAdmsUserinfoCommand({
+    const enrollment = enqueueAdmsPhotoEnrollment({
         pin,
         name,
         password,
-        verify: 0
+        tempFilePath: req.file.path
     });
-
-    const biophotoCommandId = admsCommandId++;
-    const biophotoCommand = `C:${biophotoCommandId}:DATA UPDATE BIOPHOTO PIN=${pin}\tNo=0\tIndex=0\tFileName=${pin}.jpg\tType=9\tSize=${imageSize}\tContent=${imageBase64}`;
-    encolarComando(biophotoCommand);
 
     logStore.info('adms.enroll-user-with-photo-file.enqueued', {
         pin,
-        userCommandId: userCommand.commandId,
-        biophotoCommandId,
-        savedAs: `uploads/faces/${savedFileName}`,
-        imageSize,
+        name,
+        userCommandId: enrollment.userCommandId,
+        biophotoCommandId: enrollment.biophotoCommandId,
+        savedAs: enrollment.savedPhoto,
+        imageSize: enrollment.imageSize,
         warning: 'BIOPHOTO enviado; reconocimiento facial puede requerir BIODATA'
     });
 
     res.json({
         ok: true,
         pin,
-        userCommandId: userCommand.commandId,
-        biophotoCommandId,
-        savedAs: `uploads/faces/${savedFileName}`,
-        imageSize,
+        userCommandId: enrollment.userCommandId,
+        biophotoCommandId: enrollment.biophotoCommandId,
+        savedAs: enrollment.savedPhoto,
+        imageSize: enrollment.imageSize,
         warning: 'BIOPHOTO enviado; reconocimiento facial puede requerir BIODATA'
+    });
+}));
+
+app.post('/adms/enroll-person', upload.single('image'), asyncHandler(async (req, res) => {
+    const pin = normalizePin(req.body.pin);
+    const rawName = typeof req.body.name === 'string' ? req.body.name : '';
+    const name = normalizeAdmsQueueField(rawName, 24, true);
+    const rawPassword = typeof req.body.password === 'string' ? req.body.password : '';
+    const password = normalizeAdmsQueueField(rawPassword, 24, false);
+
+    if (!pin || !name || !password) {
+        return res.status(400).json({ ok: false, error: 'Debes enviar pin, name y password validos' });
+    }
+
+    if (!req.file) {
+        return res.status(400).json({ ok: false, error: 'Debes enviar image en multipart/form-data' });
+    }
+
+    const enrollment = enqueueAdmsPhotoEnrollment({
+        pin,
+        name,
+        password,
+        tempFilePath: req.file.path
+    });
+
+    logStore.info('adms.enroll-person.enqueued', {
+        pin,
+        name,
+        userCommandId: enrollment.userCommandId,
+        biophotoCommandId: enrollment.biophotoCommandId,
+        savedPhoto: enrollment.savedPhoto,
+        imageSize: enrollment.imageSize
+    });
+
+    res.json({
+        ok: true,
+        pin,
+        name,
+        userCommandId: enrollment.userCommandId,
+        biophotoCommandId: enrollment.biophotoCommandId,
+        savedPhoto: enrollment.savedPhoto,
+        imageSize: enrollment.imageSize,
+        message: 'Persona encolada para enrolamiento ADMS'
     });
 }));
 
@@ -838,6 +870,33 @@ function enqueueAdmsUserinfoCommand({ pin, name, password, verify }) {
     return {
         commandId,
         command
+    };
+}
+
+function enqueueAdmsPhotoEnrollment({ pin, name, password, tempFilePath }) {
+    const savedFileName = `${pin}.jpg`;
+    const savedFilePath = path.join(facesUploadsDir, savedFileName);
+    fs.renameSync(tempFilePath, savedFilePath);
+
+    const imageBuffer = fs.readFileSync(savedFilePath);
+    const imageBase64 = imageBuffer.toString('base64');
+    const imageSize = imageBuffer.length;
+    const userCommand = enqueueAdmsUserinfoCommand({
+        pin,
+        name,
+        password,
+        verify: 0
+    });
+
+    const biophotoCommandId = admsCommandId++;
+    const biophotoCommand = `C:${biophotoCommandId}:DATA UPDATE BIOPHOTO PIN=${pin}\tNo=0\tIndex=0\tFileName=${pin}.jpg\tType=9\tSize=${imageSize}\tContent=${imageBase64}`;
+    encolarComando(biophotoCommand);
+
+    return {
+        userCommandId: userCommand.commandId,
+        biophotoCommandId,
+        savedPhoto: `uploads/faces/${savedFileName}`,
+        imageSize
     };
 }
 
