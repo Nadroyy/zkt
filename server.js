@@ -433,6 +433,79 @@ app.post('/adms/queue-user-verify', asyncHandler(async (req, res) => {
     });
 }));
 
+app.post('/adms/queue-copy-face', asyncHandler(async (req, res) => {
+    const sourcePin = normalizePin(req.body.sourcePin);
+    const targetPin = normalizePin(req.body.targetPin);
+
+    if (!sourcePin || !targetPin) {
+        return res.status(400).json({ ok: false, error: 'Debes enviar sourcePin y targetPin validos' });
+    }
+
+    const biophotoEntries = readJsonLinesFile(admsBiophotoLogPath);
+    const biodataEntries = readJsonLinesFile(admsBiodataLogPath);
+    const latestBiophoto = findLatestAdmsEntry(biophotoEntries, sourcePin, '9');
+    const latestBiodata = findLatestAdmsEntry(biodataEntries, sourcePin, '9');
+
+    if (!latestBiophoto) {
+        return res.status(404).json({ ok: false, error: `No existe BIOPHOTO Type=9 para sourcePin ${sourcePin}` });
+    }
+
+    if (!latestBiodata) {
+        return res.status(404).json({ ok: false, error: `No existe BIODATA Type=9 para sourcePin ${sourcePin}` });
+    }
+
+    const biophotoFileName = String(latestBiophoto.savedAs || `${latestBiophoto.pin}-${latestBiophoto.type}-${latestBiophoto.index}.jpg`);
+    const biophotoFilePath = path.join(biophotosDir, biophotoFileName);
+    if (!fs.existsSync(biophotoFilePath)) {
+        return res.status(404).json({ ok: false, error: `No existe el archivo BIOPHOTO ${biophotoFileName}` });
+    }
+
+    const biophotoBase64 = fs.readFileSync(biophotoFilePath).toString('base64');
+    const biophotoCommandId = admsCommandId++;
+    const biodataCommandId = admsCommandId++;
+    const biophotoCommand = `C:${biophotoCommandId}:DATA UPDATE BIOPHOTO PIN=${targetPin}\tNo=${latestBiophoto.no}\tIndex=${latestBiophoto.index}\tFileName=${targetPin}.jpg\tType=9\tSize=${latestBiophoto.size}\tContent=${biophotoBase64}`;
+    const biodataCommand = `C:${biodataCommandId}:DATA UPDATE BIODATA Pin=${targetPin}\tNo=${latestBiodata.no}\tIndex=${latestBiodata.index}\tValid=1\tDuress=0\tType=9\tMajorVer=35\tMinorVer=4\tFormat=0\tTmp=${latestBiodata.tmp}`;
+
+    encolarComando(biophotoCommand);
+    encolarComando(biodataCommand);
+
+    logStore.info('adms.queue-copy-face.enqueued', {
+        sourcePin,
+        targetPin,
+        biophotoCommandId,
+        biodataCommandId,
+        pendingCommands: comandosPendientes.length
+    });
+
+    res.json({
+        ok: true,
+        sourcePin,
+        targetPin,
+        commandIds: {
+            biophoto: biophotoCommandId,
+            biodata: biodataCommandId
+        },
+        summary: {
+            biophoto: {
+                no: latestBiophoto.no,
+                index: latestBiophoto.index,
+                type: latestBiophoto.type,
+                size: latestBiophoto.size,
+                fileName: `${targetPin}.jpg`
+            },
+            biodata: {
+                no: latestBiodata.no,
+                index: latestBiodata.index,
+                type: latestBiodata.type,
+                majorVer: latestBiodata.majorVer,
+                minorVer: latestBiodata.minorVer,
+                format: latestBiodata.format
+            }
+        },
+        pendingCommands: comandosPendientes.length
+    });
+}));
+
 app.get('/usuarios', asyncHandler(async (_req, res) => {
     const [rows] = await db.query('SELECT * FROM usuarios');
     res.json(rows);
@@ -657,6 +730,17 @@ function readJsonLinesFile(filePath) {
             }
         })
         .filter(Boolean);
+}
+
+function findLatestAdmsEntry(entries, pin, type) {
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        if (String(entry.pin || '') === String(pin) && String(entry.type || '') === String(type)) {
+            return entry;
+        }
+    }
+
+    return null;
 }
 
 function getRawIclockBody(req) {
